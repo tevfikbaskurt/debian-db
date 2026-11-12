@@ -7,6 +7,7 @@ STANDBY_NAME="${STANDBY_NAME:-pg-02}"
 MASTER_PORT="${MASTER_PORT:-5433}"
 STANDBY_PORT="${STANDBY_PORT:-5434}"
 POSTGRES_IMAGE="${POSTGRES_IMAGE:-postgres:16}"
+LAB_LABEL="debian-db.lab"
 MASTER_PASSWORD="${MASTER_PASSWORD:-Master_001!}"
 REPLICATION_PASSWORD="${REPLICATION_PASSWORD:-Replikasyon_01!}"
 MASTER_VOLUME="${MASTER_VOLUME:-pg-01-data}"
@@ -48,33 +49,66 @@ wait_for_postgres() {
         fi
         sleep 2
     done
-    fail "$container 120 saniye içinde hazır olmadı. `docker logs $container` çıktısını inceleyin."
+    fail "$container 120 saniye içinde hazır olmadı. docker logs $container çıktısını inceleyin."
+}
+
+resolve_existing_lab_name() {
+    local role="$1"
+    local name
+    name="$(docker ps -a \
+        --filter "label=${LAB_LABEL}=${NETWORK_NAME}" \
+        --filter "label=debian-db.role=${role}" \
+        --format '{{.Names}}')"
+    if [[ -n "$name" ]]; then
+        printf '%s' "${name%%$'\n'*}"
+    fi
+}
+
+resolve_master_name() {
+    local base_name="$MASTER_NAME"
+    local base_volume="$MASTER_VOLUME"
+    local suffix=1
+
+    while docker container inspect "$MASTER_NAME" >/dev/null 2>&1 ||
+          docker volume inspect "$MASTER_VOLUME" >/dev/null 2>&1 ||
+          [[ "$MASTER_NAME" == "$STANDBY_NAME" ]] ||
+          [[ "$MASTER_VOLUME" == "$STANDBY_VOLUME" ]]; do
+        suffix=$((suffix + 1))
+        MASTER_NAME="${base_name}-${suffix}"
+        MASTER_VOLUME="${base_volume}-${suffix}"
+    done
+
+    if [[ "$MASTER_NAME" != "$base_name" ]]; then
+        log "Birincil adı kullanımda; alternatif ad seçildi: $MASTER_NAME"
+    fi
 }
 
 setup_cluster() {
     require_root
     command -v docker >/dev/null 2>&1 || fail "Docker bulunamadı. Önce: sudo $0 install-docker"
-    docker info >/dev/null 2>&1 || fail "Docker servisine erişilemiyor. `sudo systemctl start docker` komutunu çalıştırın."
+    docker info >/dev/null 2>&1 || fail "Docker servisine erişilemiyor. sudo systemctl start docker komutunu çalıştırın."
 
-    if docker container inspect "$MASTER_NAME" >/dev/null 2>&1 ||
-       docker container inspect "$STANDBY_NAME" >/dev/null 2>&1; then
-        fail "Düğüm adlarından biri zaten kullanımda. Önce mevcut kaynakları inceleyin; sıfırlamak için: sudo $0 cleanup"
+    resolve_master_name
+
+    if docker container inspect "$STANDBY_NAME" >/dev/null 2>&1; then
+        fail "Yedek düğüm adı zaten kullanımda: $STANDBY_NAME. Mevcut kaynağı inceleyin."
     fi
-
-    if docker volume inspect "$MASTER_VOLUME" >/dev/null 2>&1 ||
-       docker volume inspect "$STANDBY_VOLUME" >/dev/null 2>&1; then
-        fail "Veri birimi adlarından biri zaten kullanımda. Mevcut veriyi inceleyin; sıfırlamak için: sudo $0 cleanup"
+    if docker volume inspect "$STANDBY_VOLUME" >/dev/null 2>&1; then
+        fail "Yedek veri birimi adı zaten kullanımda: $STANDBY_VOLUME. Mevcut veriyi inceleyin."
     fi
 
     if docker network inspect "$NETWORK_NAME" >/dev/null 2>&1; then
         fail "Ağ adı zaten kullanımda: $NETWORK_NAME. Mevcut ağı inceleyin; sıfırlamak için: sudo $0 cleanup"
     fi
-    docker network create "$NETWORK_NAME" >/dev/null
+    docker network create --label "${LAB_LABEL}=${NETWORK_NAME}" "$NETWORK_NAME" >/dev/null
 
-    docker volume create "$MASTER_VOLUME" >/dev/null
+    docker volume create --label "${LAB_LABEL}=${NETWORK_NAME}" \
+        --label debian-db.role=master "$MASTER_VOLUME" >/dev/null
     log "$MASTER_NAME birincil düğümü başlatılıyor."
     docker run -d \
         --name "$MASTER_NAME" \
+        --label "${LAB_LABEL}=${NETWORK_NAME}" \
+        --label debian-db.role=master \
         --network "$NETWORK_NAME" \
         -p "${MASTER_PORT}:5432" \
         -v "${MASTER_VOLUME}:/var/lib/postgresql/data" \
@@ -103,7 +137,8 @@ setup_cluster() {
     docker exec "$MASTER_NAME" psql -U postgres -v ON_ERROR_STOP=1 \
         -c "SELECT pg_reload_conf();" >/dev/null
 
-    docker volume create "$STANDBY_VOLUME" >/dev/null
+    docker volume create --label "${LAB_LABEL}=${NETWORK_NAME}" \
+        --label debian-db.role=standby "$STANDBY_VOLUME" >/dev/null
     log "$STANDBY_NAME için ilk veri kopyası alınıyor."
     docker run --rm \
         --network "$NETWORK_NAME" \
@@ -134,6 +169,8 @@ setup_cluster() {
     log "$STANDBY_NAME yedek düğümü başlatılıyor."
     docker run -d \
         --name "$STANDBY_NAME" \
+        --label "${LAB_LABEL}=${NETWORK_NAME}" \
+        --label debian-db.role=standby \
         --network "$NETWORK_NAME" \
         -p "${STANDBY_PORT}:5432" \
         -v "${STANDBY_VOLUME}:/var/lib/postgresql/data" \
@@ -159,7 +196,7 @@ setup_cluster() {
             break
         fi
         if [[ "$attempt" -eq 30 ]]; then
-            fail "$STANDBY_NAME replikasyonu veya başlangıç kaydı doğrulanamadı. `docker logs $STANDBY_NAME` çıktısını inceleyin."
+            fail "$STANDBY_NAME replikasyonu veya başlangıç kaydı doğrulanamadı. docker logs $STANDBY_NAME çıktısını inceleyin."
         fi
         sleep 2
     done
@@ -171,6 +208,12 @@ setup_cluster() {
 
 show_status() {
     command -v docker >/dev/null 2>&1 || fail "Docker bulunamadı."
+    local found_master
+    local found_standby
+    found_master="$(resolve_existing_lab_name master)"
+    found_standby="$(resolve_existing_lab_name standby)"
+    [[ -z "$found_master" ]] || MASTER_NAME="$found_master"
+    [[ -z "$found_standby" ]] || STANDBY_NAME="$found_standby"
     docker ps --filter "name=^/${MASTER_NAME}$" --filter "name=^/${STANDBY_NAME}$" \
         --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'
     if docker container inspect "$MASTER_NAME" >/dev/null 2>&1 &&
@@ -184,14 +227,29 @@ show_status() {
 
 cleanup_cluster() {
     require_root
-    printf 'UYARI: %s ve %s konteynerleri ile %s ve %s veri birimleri silinecek.\n' \
-        "$MASTER_NAME" "$STANDBY_NAME" "$MASTER_VOLUME" "$STANDBY_VOLUME"
+    local found_master
+    local found_standby
+    local network_label
+    local -a lab_volumes
+    found_master="$(resolve_existing_lab_name master)"
+    found_standby="$(resolve_existing_lab_name standby)"
+    [[ -z "$found_master" ]] || MASTER_NAME="$found_master"
+    [[ -z "$found_standby" ]] || STANDBY_NAME="$found_standby"
+    mapfile -t lab_volumes < <(docker volume ls -q --filter "label=${LAB_LABEL}=${NETWORK_NAME}")
+
+    printf 'UYARI: %s ve %s konteynerleri, %s etiketli veri birimleri ve laboratuvar ağı silinecek.\n' \
+        "$MASTER_NAME" "$STANDBY_NAME" "$NETWORK_NAME"
     read -r -p 'Devam etmek için "evet" yazın: ' confirmation
     [[ "$confirmation" == "evet" ]] || fail "Temizlik iptal edildi."
 
-    docker rm -f "$MASTER_NAME" "$STANDBY_NAME" >/dev/null 2>&1 || true
-    docker network rm "$NETWORK_NAME" >/dev/null 2>&1 || true
-    docker volume rm "$MASTER_VOLUME" "$STANDBY_VOLUME" >/dev/null 2>&1 || true
+    if [[ -n "$found_master" ]]; then docker rm -f "$found_master" >/dev/null; fi
+    if [[ -n "$found_standby" ]]; then docker rm -f "$found_standby" >/dev/null; fi
+    if ((${#lab_volumes[@]})); then docker volume rm "${lab_volumes[@]}" >/dev/null; fi
+    network_label="$(docker network inspect --format \
+        "{{ index .Labels \"${LAB_LABEL}\" }}" "$NETWORK_NAME" 2>/dev/null || true)"
+    if [[ "$network_label" == "$NETWORK_NAME" ]]; then
+        docker network rm "$NETWORK_NAME" >/dev/null
+    fi
     log "Belirtilen laboratuvar kaynakları kaldırıldı."
 }
 
@@ -202,7 +260,7 @@ Kullanım: sudo $0 {install-docker|setup|status|cleanup}
   install-docker  Debian'ın docker.io paketini kurar ve servisi başlatır.
   setup           pg-01/pg-02 PostgreSQL 16 replikasyon laboratuvarını kurar.
   status          Düğüm ve replikasyon durumunu gösterir.
-  cleanup         Laboratuvar konteynerlerini, ağını ve veri birimini siler.
+  cleanup         Laboratuvar konteynerlerini, ağını ve veri birimlerini siler.
 
 Parolalar, portlar ve veri birimleri ortam değişkenleriyle değiştirilebilir:
   MASTER_PASSWORD, REPLICATION_PASSWORD, MASTER_PORT, STANDBY_PORT

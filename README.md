@@ -30,6 +30,8 @@ sudo ./debian-postgresql-replication.sh status
 
 `setup`, düğümleri başlatır, `replicator` rolünü oluşturur, replikasyon erişimini açar, yedek düğüme başlangıç kopyasını alır ve örnek tablo/veriyi ekler. Her iki düğümün verisi de Docker volume içinde tutulur. Son adımda yedek düğümden tabloyu sorgulayarak kurulumu doğrular.
 
+Docker'da `pg-01` adı veya buna ait veri birimi zaten varsa betik birincil düğüm için `pg-01-2`, sonraki çakışmalarda `pg-01-3` gibi boş bir ad ve ona karşılık gelen veri birimini seçer. `status` ve `cleanup` bu alternatifi Docker etiketlerinden bulur. `pg-02` ya da `bulut-net` adı kullanımda ise kurulum güvenli şekilde durur. Container adının otomatik değişmesi host portlarını değiştirmez; `5433`/`5434` portları doluysa kurulumdan önce ortam değişkenleriyle boş port verin.
+
 Script varsayılan değerleri kullanır; port veya parola değişikliği ortam değişkenleriyle yapılabilir:
 
 ```bash
@@ -38,7 +40,7 @@ sudo MASTER_PORT=5433 STANDBY_PORT=5434 \
   ./debian-postgresql-replication.sh setup
 ```
 
-İlk kurulumdan sonra aynı adla çalışan düğüm varsa `setup` güvenlik amacıyla durur. Mevcut konteynerleri veya verileri incelemeden temizleme çalıştırmayın.
+Birincil adı çakışırsa betik alternatif ad seçer; yedek adı veya ağ adı çakışırsa `setup` güvenlik amacıyla durur. Mevcut konteynerleri veya verileri incelemeden temizleme çalıştırmayın.
 
 ## DBeaver bağlantıları
 
@@ -57,16 +59,17 @@ Her düğüm için ayrı PostgreSQL bağlantısı oluşturun:
 ```sql
 SELECT id, isim FROM cihazlar ORDER BY id;
 
+INSERT INTO cihazlar (isim) VALUES ('Hatalı Giriş');
 INSERT INTO cihazlar (isim) VALUES ('Bulut Sunucu 02');
 ```
 
-Ardından `pg-02` bağlantısında sorguyu çalıştırın:
+Bu iki INSERT'i birincilde çalıştırdıktan sonra `pg-02` bağlantısında sorguyu çalıştırın:
 
 ```sql
 SELECT id, isim FROM cihazlar ORDER BY id;
 ```
 
-Yedek düğümde birincildeki kayıtların görünmesi replikasyonun çalıştığını gösterir. PostgreSQL standby düğümü salt okunurdur; INSERT/UPDATE/DELETE işlemlerini `pg-01` üzerinde yapın. Nottaki `Hatalı Giriş` örneği standby üzerinde yazma denemesi olarak düşünülebilir ve hata vermesi beklenir. Bu, replika hatası değil, standby'ın korunan çalışma biçimidir.
+Yedek düğümde birincildeki kayıtların görünmesi replikasyonun çalıştığını gösterir. Kaynaktaki `Hatalı Giriş` sadece örnek bir kayıt adıdır; birincilde çalıştırıldığında hata vermez ve replike edilir. PostgreSQL standby düğümü salt okunurdur; INSERT/UPDATE/DELETE işlemlerini `pg-01` üzerinde yapın. Standby'da ayrıca INSERT deneyerek salt-okunurluğu kontrol edebilirsiniz; yazma reddedilmelidir.
 
 > Portlar Docker tarafından host arayüzlerine yayımlanır. Debian sunucusuna başka makinelerden bağlanacaksanız güvenlik duvarında yalnızca güvenilir istemci adreslerine izin verin; laboratuvar parolalarını üretim ortamında kullanmayın.
 
@@ -76,7 +79,7 @@ Yedek düğümde birincildeki kayıtların görünmesi replikasyonun çalıştı
 # Replikasyon bağlantısı ve standby salt-okunurluk durumu
 sudo ./debian-postgresql-replication.sh status
 
-# Konteyner günlükleri
+# Konteyner günlükleri (alternatif birincil adı seçildiyse `status` çıktısındaki adı kullanın)
 sudo docker logs pg-01
 sudo docker logs pg-02
 
