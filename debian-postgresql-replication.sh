@@ -12,6 +12,7 @@ MASTER_PASSWORD="${MASTER_PASSWORD:-Master_001!}"
 REPLICATION_PASSWORD="${REPLICATION_PASSWORD:-Replikasyon_01!}"
 MASTER_VOLUME="${MASTER_VOLUME:-pg-01-data}"
 STANDBY_VOLUME="${STANDBY_VOLUME:-pg-02-data}"
+INTERACTIVE_INSTALL=0
 
 log() {
     printf '[%s] %s\n' "$(date '+%H:%M:%S')" "$*"
@@ -30,14 +31,162 @@ require_root() {
 
 install_docker() {
     require_root "$@"
-    if [[ ! -r /etc/debian_version ]]; then
-        fail "Bu kurulum adımı Debian içindir."
+    if [[ ! -r /etc/os-release ]]; then
+        fail "Desteklenen işletim sistemi Debian veya Ubuntu olmalıdır."
     fi
+    . /etc/os-release
+    case "${ID:-}" in
+        debian|ubuntu) ;;
+        *) fail "Desteklenen işletim sistemi Debian veya Ubuntu olmalıdır (bulunan: ${ID:-bilinmiyor})." ;;
+    esac
 
     apt-get update
     apt-get install -y docker.io
     systemctl enable --now docker
     log "Docker kuruldu ve başlatıldı."
+}
+
+prompt_value() {
+    local prompt="$1"
+    local default="$2"
+    local answer
+    read -r -p "$prompt [$default]: " answer
+    printf '%s' "${answer:-$default}"
+}
+
+valid_docker_name() {
+    [[ "$1" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ ]]
+}
+
+node_pair_available() {
+    local name="$1"
+    local volume="$2"
+    local other_name="$3"
+    local other_volume="$4"
+
+    [[ "$name" != "$other_name" && "$volume" != "$other_volume" ]] &&
+        ! docker container inspect "$name" >/dev/null 2>&1 &&
+        ! docker volume inspect "$volume" >/dev/null 2>&1
+}
+
+resolve_node_names() {
+    local base_name base_volume candidate candidate_volume suffix entered
+
+    base_name="$MASTER_NAME"
+    base_volume="$MASTER_VOLUME"
+    if ! node_pair_available "$MASTER_NAME" "$MASTER_VOLUME" "$STANDBY_NAME" "$STANDBY_VOLUME"; then
+        suffix=2
+        candidate="${base_name}-${suffix}"
+        candidate_volume="${base_volume}-${suffix}"
+        while ! node_pair_available "$candidate" "$candidate_volume" "$STANDBY_NAME" "$STANDBY_VOLUME"; do
+            suffix=$((suffix + 1))
+            candidate="${base_name}-${suffix}"
+            candidate_volume="${base_volume}-${suffix}"
+        done
+        if ((INTERACTIVE_INSTALL)); then
+            entered="$(prompt_value "Birincil adı çakışıyor. Alternatif birincil düğüm adı" "$candidate")"
+            valid_docker_name "$entered" || fail "Geçersiz Docker düğüm adı: $entered"
+            candidate="$entered"
+            candidate_volume="${candidate}-data"
+            node_pair_available "$candidate" "$candidate_volume" "$STANDBY_NAME" "$STANDBY_VOLUME" ||
+                fail "Seçilen alternatif düğüm adı veya veri birimi kullanımda: $candidate / $candidate_volume"
+        fi
+        MASTER_NAME="$candidate"
+        MASTER_VOLUME="$candidate_volume"
+        log "Mevcut kaynaklar korunuyor; yeni birincil adı: $MASTER_NAME"
+    fi
+
+    base_name="$STANDBY_NAME"
+    base_volume="$STANDBY_VOLUME"
+    if ! node_pair_available "$STANDBY_NAME" "$STANDBY_VOLUME" "$MASTER_NAME" "$MASTER_VOLUME"; then
+        suffix=2
+        candidate="${base_name}-${suffix}"
+        candidate_volume="${base_volume}-${suffix}"
+        while ! node_pair_available "$candidate" "$candidate_volume" "$MASTER_NAME" "$MASTER_VOLUME"; do
+            suffix=$((suffix + 1))
+            candidate="${base_name}-${suffix}"
+            candidate_volume="${base_volume}-${suffix}"
+        done
+        if ((INTERACTIVE_INSTALL)); then
+            entered="$(prompt_value "Yedek adı çakışıyor. Alternatif yedek düğüm adı" "$candidate")"
+            valid_docker_name "$entered" || fail "Geçersiz Docker düğüm adı: $entered"
+            candidate="$entered"
+            candidate_volume="${candidate}-data"
+            node_pair_available "$candidate" "$candidate_volume" "$MASTER_NAME" "$MASTER_VOLUME" ||
+                fail "Seçilen alternatif düğüm adı veya veri birimi kullanımda: $candidate / $candidate_volume"
+        fi
+        STANDBY_NAME="$candidate"
+        STANDBY_VOLUME="$candidate_volume"
+        log "Mevcut kaynaklar korunuyor; yeni yedek adı: $STANDBY_NAME"
+    fi
+}
+
+resolve_network_name() {
+    local base_name="$NETWORK_NAME"
+    local candidate
+    local suffix=2
+
+    if docker network inspect "$NETWORK_NAME" >/dev/null 2>&1; then
+        candidate="${base_name}-${suffix}"
+        while docker network inspect "$candidate" >/dev/null 2>&1; do
+            suffix=$((suffix + 1))
+            candidate="${base_name}-${suffix}"
+        done
+        if ((INTERACTIVE_INSTALL)); then
+            candidate="$(prompt_value "Ağ adı kullanımda. Yeni laboratuvar ağı" "$candidate")"
+            valid_docker_name "$candidate" || fail "Geçersiz Docker ağ adı: $candidate"
+            docker network inspect "$candidate" >/dev/null 2>&1 &&
+                fail "Seçilen Docker ağı zaten kullanımda: $candidate"
+        fi
+        NETWORK_NAME="$candidate"
+        log "Mevcut ağ korunuyor; yeni laboratuvar ağı: $NETWORK_NAME"
+    fi
+}
+
+port_is_in_use() {
+    local port="$1"
+    if command -v ss >/dev/null 2>&1 && ss -H -ltn "sport = :$port" | grep -q .; then
+        return 0
+    fi
+    docker ps -a --format '{{.Ports}}' |
+        grep -Eq "(^|[,:])${port}->"
+}
+
+resolve_ports() {
+    local label="$1"
+    local current="$2"
+    local other="$3"
+    local candidate="$current"
+    local entered
+
+    if [[ ! "$candidate" =~ ^[0-9]+$ ]]; then
+        fail "$label geçerli bir TCP portu değil: $candidate"
+    fi
+    candidate=$((10#$candidate))
+    if ((candidate < 1 || candidate > 65535)); then
+        fail "$label geçerli bir TCP portu değil: $candidate"
+    fi
+    if port_is_in_use "$candidate" || [[ "$candidate" == "$other" ]]; then
+        if ((INTERACTIVE_INSTALL)); then
+            candidate=$((candidate + 1))
+            while ((candidate <= 65535)) && { port_is_in_use "$candidate" || [[ "$candidate" == "$other" ]]; }; do
+                candidate=$((candidate + 1))
+            done
+            ((candidate <= 65535)) || fail "Kullanılabilir port bulunamadı."
+            entered="$(prompt_value "$label kullanımda. Alternatif host portu" "$candidate")"
+            [[ "$entered" =~ ^[0-9]+$ ]] || fail "Geçersiz TCP portu: $entered"
+            entered=$((10#$entered))
+            ((entered >= 1 && entered <= 65535)) ||
+                fail "Geçersiz TCP portu: $entered"
+            if port_is_in_use "$entered" || [[ "$entered" == "$other" ]]; then
+                fail "Seçilen TCP portu kullanımda veya diğer düğümle aynı: $entered"
+            fi
+            candidate="$entered"
+        else
+            fail "$label portu kullanımda veya diğer düğümle aynı: $candidate. Boş port seçin."
+        fi
+    fi
+    printf '%s' "$candidate"
 }
 
 wait_for_postgres() {
@@ -64,43 +213,19 @@ resolve_existing_lab_name() {
     fi
 }
 
-resolve_master_name() {
-    local base_name="$MASTER_NAME"
-    local base_volume="$MASTER_VOLUME"
-    local suffix=1
-
-    while docker container inspect "$MASTER_NAME" >/dev/null 2>&1 ||
-          docker volume inspect "$MASTER_VOLUME" >/dev/null 2>&1 ||
-          [[ "$MASTER_NAME" == "$STANDBY_NAME" ]] ||
-          [[ "$MASTER_VOLUME" == "$STANDBY_VOLUME" ]]; do
-        suffix=$((suffix + 1))
-        MASTER_NAME="${base_name}-${suffix}"
-        MASTER_VOLUME="${base_volume}-${suffix}"
-    done
-
-    if [[ "$MASTER_NAME" != "$base_name" ]]; then
-        log "Birincil adı kullanımda; alternatif ad seçildi: $MASTER_NAME"
-    fi
-}
-
 setup_cluster() {
     local pgpass_password
     require_root
     command -v docker >/dev/null 2>&1 || fail "Docker bulunamadı. Önce: sudo $0 install-docker"
     docker info >/dev/null 2>&1 || fail "Docker servisine erişilemiyor. sudo systemctl start docker komutunu çalıştırın."
 
-    resolve_master_name
-
-    if docker container inspect "$STANDBY_NAME" >/dev/null 2>&1; then
-        fail "Yedek düğüm adı zaten kullanımda: $STANDBY_NAME. Mevcut kaynağı inceleyin."
-    fi
-    if docker volume inspect "$STANDBY_VOLUME" >/dev/null 2>&1; then
-        fail "Yedek veri birimi adı zaten kullanımda: $STANDBY_VOLUME. Mevcut veriyi inceleyin."
-    fi
-
-    if docker network inspect "$NETWORK_NAME" >/dev/null 2>&1; then
-        fail "Ağ adı zaten kullanımda: $NETWORK_NAME. Mevcut ağı inceleyin; sıfırlamak için: sudo $0 cleanup"
-    fi
+    valid_docker_name "$NETWORK_NAME" || fail "Geçersiz Docker ağ adı: $NETWORK_NAME"
+    valid_docker_name "$MASTER_NAME" || fail "Geçersiz birincil düğüm adı: $MASTER_NAME"
+    valid_docker_name "$STANDBY_NAME" || fail "Geçersiz yedek düğüm adı: $STANDBY_NAME"
+    resolve_node_names
+    resolve_network_name
+    MASTER_PORT="$(resolve_ports "Birincil portu" "$MASTER_PORT" "")"
+    STANDBY_PORT="$(resolve_ports "Yedek portu" "$STANDBY_PORT" "$MASTER_PORT")"
     docker network create --label "${LAB_LABEL}=${NETWORK_NAME}" "$NETWORK_NAME" >/dev/null
 
     docker volume create --label "${LAB_LABEL}=${NETWORK_NAME}" \
@@ -208,7 +333,77 @@ SQL
 
     docker exec "$STANDBY_NAME" psql -U postgres -v ON_ERROR_STOP=1 -c \
         "SELECT id, isim FROM cihazlar ORDER BY id;"
-    log "Kurulum tamamlandı. Birincil: localhost:$MASTER_PORT; yedek (salt okunur): localhost:$STANDBY_PORT"
+    log "Kurulum tamamlandı."
+    show_connection_details
+}
+
+show_connection_details() {
+    local host_address
+    host_address="$(hostname -I 2>/dev/null | awk '{print $1}')"
+    [[ -n "$host_address" ]] || host_address="Sunucunun erişilebilir IP adresi"
+
+    cat <<EOF
+
+DBeaver bağlantı bilgileri
+--------------------------
+Host:       $host_address (uzak istemcide erişilebilir IP/DNS; aynı makinede localhost)
+Veritabanı: postgres
+Kullanıcı:  postgres
+Parola:     $MASTER_PASSWORD
+
+Birincil (yazma/okuma):
+  Düğüm: $MASTER_NAME
+  Port:  $MASTER_PORT
+
+Yedek (salt okunur):
+  Düğüm: $STANDBY_NAME
+  Port:  $STANDBY_PORT
+
+Replikasyon kullanıcısı: replicator
+Replikasyon parolası:    $REPLICATION_PASSWORD
+
+EOF
+    if [[ "$NETWORK_NAME" != "bulut-net" ]]; then
+        printf "Durum kontrolü:\n  sudo env NETWORK_NAME='%s' '%s' status\n" "$NETWORK_NAME" "$0"
+        printf "Temizleme (verileri siler):\n  sudo env NETWORK_NAME='%s' '%s' cleanup\n" "$NETWORK_NAME" "$0"
+    else
+        printf "Durum kontrolü:\n  sudo '%s' status\n" "$0"
+        printf "Temizleme (verileri siler):\n  sudo %s cleanup\n" "$0"
+    fi
+}
+
+interactive_install() {
+    local confirmation
+
+    require_root
+    [[ -t 0 ]] || fail "Etkileşimli kurulum terminal gerektirir. Terminalde sudo $0 install komutunu çalıştırın."
+
+    NETWORK_NAME="$(prompt_value "Docker ağı adı" "$NETWORK_NAME")"
+    MASTER_NAME="$(prompt_value "Birincil düğüm adı" "$MASTER_NAME")"
+    STANDBY_NAME="$(prompt_value "Yedek düğüm adı" "$STANDBY_NAME")"
+    MASTER_PORT="$(prompt_value "Birincil host portu" "$MASTER_PORT")"
+    STANDBY_PORT="$(prompt_value "Yedek host portu" "$STANDBY_PORT")"
+    MASTER_PASSWORD="$(prompt_value "PostgreSQL/DBeaver parolası" "$MASTER_PASSWORD")"
+    REPLICATION_PASSWORD="$(prompt_value "Replikasyon parolası" "$REPLICATION_PASSWORD")"
+
+    printf '\nKurulum özeti (Enter varsayılanları kabul eder):\n'
+    printf '  Ağ: %s\n  Birincil: %s:%s\n  Yedek: %s:%s\n' \
+        "$NETWORK_NAME" "$MASTER_NAME" "$MASTER_PORT" "$STANDBY_NAME" "$STANDBY_PORT"
+    read -r -p 'Devam edilsin mi? [E/h]: ' confirmation
+    [[ -z "$confirmation" || "$confirmation" =~ ^[EeYy]$ ]] ||
+        fail "Kurulum kullanıcı tarafından iptal edildi."
+
+    if ! command -v docker >/dev/null 2>&1; then
+        install_docker
+    elif ! docker info >/dev/null 2>&1; then
+        if command -v systemctl >/dev/null 2>&1; then
+            systemctl enable --now docker
+        fi
+        docker info >/dev/null 2>&1 || fail "Docker daemon başlatılamadı veya erişilemiyor."
+    fi
+
+    INTERACTIVE_INSTALL=1
+    setup_cluster
 }
 
 show_status() {
@@ -260,10 +455,11 @@ cleanup_cluster() {
 
 usage() {
     cat <<EOF
-Kullanım: sudo $0 {install-docker|setup|status|cleanup}
+Kullanım: sudo $0 {install|install-docker|setup|status|cleanup}
 
-  install-docker  Debian'ın docker.io paketini kurar ve servisi başlatır.
-  setup           pg-01/pg-02 PostgreSQL 16 replikasyon laboratuvarını kurar.
+  install         Docker'ı gerekirse kurar, sorularla ayarları alır ve iki düğümü kurar.
+  install-docker  Debian/Ubuntu'nun docker.io paketini kurar ve servisi başlatır.
+  setup           Varsayılan/ortam ayarlarıyla iki PostgreSQL düğümünü kurar.
   status          Düğüm ve replikasyon durumunu gösterir.
   cleanup         Laboratuvar konteynerlerini, ağını ve veri birimlerini siler.
 
@@ -274,6 +470,7 @@ EOF
 }
 
 case "${1:-}" in
+    install) interactive_install ;;
     install-docker) install_docker ;;
     setup) setup_cluster ;;
     status) show_status ;;
