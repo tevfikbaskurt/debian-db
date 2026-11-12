@@ -1,0 +1,74 @@
+network adı : bulut-net
+master node adı : pg-01
+slave node adı : pg-02
+
+master şifresi : Master_001!
+Replikasyon şifresi : Replikasyon_01!
+
+Bu parametreler ışığında 2 node postgresql nodu oluşturup Dbeaver ile bu nodlara bağlanıp veri girişi yapınız
+
+
+
+
+
+sudo docker network create bulut-cluster-net
+
+sudo docker run -d --name pg-master --network bulut-cluster-net -p 5433:5432 -e POSTGRES_PASSWORD=MasterSecret123! postgres:16 -c wal_level=replica -c max_wal_senders=5 -c max_replication_slots=5
+
+
+sudo docker exec -i pg-master psql -U postgres -c CREATE USER replicator WITH REPLICATION ENCRYPTED PASSWORD 'ReplicaSecret123!';
+
+
+sudo docker exec -it pg-master bash
+
+psql -U postgres
+
+CREATE USER replicator WITH REPLICATION LOGIN PASSWORD 'ReplicaSecret123!';
+
+CREATE ROLE replicator WITH REPLICATION LOGIN PASSWORD 'ReplicaSecret123!';
+
+\q
+
+exit
+
+sudo apt-get update
+sudo apt-get install vim
+
+sudo vim   /var/lib/postgresql/data/pg_hba.conf
+
+
+host    replication     replicator      0.0.0.0/0               scram-sha-256
+
+sudo docker restart pg-master
+
+sudo docker run --rm -it --network bulut-cluster-net -v pg-slave-data:/var/lib/postgresql/data postgres:16 pg_basebackup -h pg-master -D /var/lib/postgresql/data \
+  -U replicator \
+  -W -v -P -R -X stream
+
+
+sudo docker run -d --name pg-slave --network bulut-cluster-net  -p 5434:5432 -v pg-slave-data:/var/lib/postgresql/data  postgres:16
+
+
+CREATE TABLE cihazlar (id SERIAL PRIMARY KEY, isim VARCHAR(50));
+
+INSERT INTO cihazlar (isim) VALUES ('Bulut Sunucu 01');
+
+SELECT * FROM cihazlar;
+
+
+INSERT INTO cihazlar (isim) VALUES ('Hatalı Giriş');
+
+
+docker network disconnect bulut-cluster-net pg-slave
+
+INSERT INTO cihazlar (isim) VALUES ('Bulut Sunucu 02');
+
+
+SELECT * FROM cihazlar;
+
+
+
+docker rm -f pg-master pg-slave && docker network rm bulut-cluster-net && docker volume rm pg-slave-data
+
+
+sudo docker cp pg_hba.conf pg-master:/var/lib/postgresql/data/
