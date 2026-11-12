@@ -84,6 +84,7 @@ resolve_master_name() {
 }
 
 setup_cluster() {
+    local pgpass_password
     require_root
     command -v docker >/dev/null 2>&1 || fail "Docker bulunamadı. Önce: sudo $0 install-docker"
     docker info >/dev/null 2>&1 || fail "Docker servisine erişilemiyor. sudo systemctl start docker komutunu çalıştırın."
@@ -123,12 +124,14 @@ setup_cluster() {
     if docker exec "$MASTER_NAME" psql -U postgres -tAc \
         "SELECT 1 FROM pg_roles WHERE rolname = 'replicator'" | grep -q 1; then
         docker exec -i "$MASTER_NAME" psql -U postgres -v ON_ERROR_STOP=1 \
-            -v "replication_password=$REPLICATION_PASSWORD" \
-            -c "ALTER ROLE replicator WITH REPLICATION LOGIN PASSWORD :'replication_password';" >/dev/null
+            -v "replication_password=$REPLICATION_PASSWORD" >/dev/null <<'SQL'
+ALTER ROLE replicator WITH REPLICATION LOGIN PASSWORD :'replication_password';
+SQL
     else
         docker exec -i "$MASTER_NAME" psql -U postgres -v ON_ERROR_STOP=1 \
-            -v "replication_password=$REPLICATION_PASSWORD" \
-            -c "CREATE ROLE replicator WITH REPLICATION LOGIN PASSWORD :'replication_password';" >/dev/null
+            -v "replication_password=$REPLICATION_PASSWORD" >/dev/null <<'SQL'
+CREATE ROLE replicator WITH REPLICATION LOGIN PASSWORD :'replication_password';
+SQL
     fi
 
     docker exec "$MASTER_NAME" sh -c \
@@ -152,15 +155,17 @@ setup_cluster() {
         -Fp -Xs -P -R \
         -d "host=$MASTER_NAME user=replicator"
 
+    pgpass_password="${REPLICATION_PASSWORD//\\/\\\\}"
+    pgpass_password="${pgpass_password//:/\\:}"
     docker run --rm \
         --user root \
         -e "MASTER_NAME=$MASTER_NAME" \
-        -e "REPLICATION_PASSWORD=$REPLICATION_PASSWORD" \
+        -e "PGPASS_PASSWORD=$pgpass_password" \
         -v "${STANDBY_VOLUME}:/var/lib/postgresql/data" \
         --entrypoint sh \
         "$POSTGRES_IMAGE" \
         -c 'umask 077
-            printf "%s:5432:replication:replicator:%s\n" "$MASTER_NAME" "$REPLICATION_PASSWORD" > /var/lib/postgresql/data/.pgpass
+            printf "%s:5432:replication:replicator:%s\n" "$MASTER_NAME" "$PGPASS_PASSWORD" > /var/lib/postgresql/data/.pgpass
             chown postgres:postgres /var/lib/postgresql/data/.pgpass
             chmod 600 /var/lib/postgresql/data/.pgpass
             sed -i "/^[[:space:]]*primary_conninfo[[:space:]]*=/d" /var/lib/postgresql/data/postgresql.auto.conf
